@@ -1,12 +1,15 @@
-"""CSV 의견 임베딩·클러스터링 분석 Gradio 애플리케이션."""
+"""CSV 의견 임베딩·클러스터링 분석 Streamlit 애플리케이션."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
+from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -20,6 +23,7 @@ from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
 from umap import UMAP
 
 
@@ -28,6 +32,19 @@ MODEL_NAME = (
     "paraphrase-multilingual-MiniLM-L12-v2"
 )
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
+
+VOICE_TYPE_ORDER = [
+    "대표 의견",
+    "경계 의견",
+    "숨은 목소리",
+    "일반 의견",
+]
+VOICE_SYMBOL_MAP = {
+    "대표 의견": "star",
+    "경계 의견": "diamond-open",
+    "숨은 목소리": "x",
+    "일반 의견": "circle",
+}
 
 GEMINI_SUMMARY_SCHEMA = {
     "type": "object",
@@ -532,6 +549,189 @@ def _get_representative_opinions(
     )
 
 
+def _minmax_scale(values: np.ndarray) -> np.ndarray:
+    """배열을 0~1로 정규화하되 상수 배열은 0으로 반환한다."""
+    values = np.asarray(values, dtype=float)
+    minimum = float(np.min(values))
+    maximum = float(np.max(values))
+    if np.isclose(minimum, maximum):
+        return np.zeros_like(values, dtype=float)
+    return (values - minimum) / (maximum - minimum)
+
+
+def _classify_opinion_roles(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    kmeans: KMeans,
+    representative_per_cluster: int = 3,
+) -> pd.DataFrame:
+    """대표·경계·숨은 목소리 후보를 임베딩 거리로 분류한다.
+
+    경계 의견은 1·2순위 클러스터 유사도 차이가 작은 문장이고,
+    숨은 목소리는 클러스터 중심에서는 멀지만 가까운 이웃끼리의
+    응집도가 상대적으로 높은 작은 의제 후보이다.
+    """
+    sample_count = len(df)
+    center_similarities = cosine_similarity(
+        embeddings,
+        kmeans.cluster_centers_,
+    )
+    assigned_clusters = kmeans.labels_.astype(int)
+    assigned_similarity = center_similarities[
+        np.arange(sample_count), assigned_clusters
+    ]
+
+    other_similarities = center_similarities.copy()
+    other_similarities[
+        np.arange(sample_count), assigned_clusters
+    ] = -np.inf
+    second_similarity = other_similarities.max(axis=1)
+    cluster_margin = assigned_similarity - second_similarity
+
+    neighbor_count = min(6, sample_count)
+    neighbor_model = NearestNeighbors(
+        n_neighbors=neighbor_count,
+        metric="cosine",
+        algorithm="brute",
+    )
+    neighbor_distances, _ = neighbor_model.fit(embeddings).kneighbors(
+        embeddings
+    )
+    if neighbor_count > 1:
+        local_cohesion = 1.0 - neighbor_distances[:, 1:].mean(axis=1)
+    else:
+        local_cohesion = np.ones(sample_count, dtype=float)
+
+    representative_mask = np.zeros(sample_count, dtype=bool)
+    for cluster_id in range(kmeans.n_clusters):
+        positions = np.flatnonzero(assigned_clusters == cluster_id)
+        ranked = positions[
+            np.argsort(
+                -assigned_similarity[positions],
+                kind="stable",
+            )[:representative_per_cluster]
+        ]
+        representative_mask[ranked] = True
+
+    boundary_cutoff = float(np.quantile(cluster_margin, 0.15))
+    boundary_mask = (
+        (cluster_margin <= boundary_cutoff)
+        & ~representative_mask
+    )
+
+    hidden_voice_score = (
+        _minmax_scale(1.0 - assigned_similarity) * 0.65
+        + _minmax_scale(local_cohesion) * 0.35
+    )
+    hidden_eligible = ~representative_mask & ~boundary_mask
+    hidden_mask = np.zeros(sample_count, dtype=bool)
+    eligible_positions = np.flatnonzero(hidden_eligible)
+    if len(eligible_positions) > 0:
+        hidden_cutoff = float(
+            np.quantile(hidden_voice_score[eligible_positions], 0.90)
+        )
+        center_cutoff = float(np.quantile(assigned_similarity, 0.50))
+        hidden_mask = (
+            hidden_eligible
+            & (hidden_voice_score >= hidden_cutoff)
+            & (assigned_similarity <= center_cutoff)
+        )
+        if not hidden_mask.any():
+            best_position = eligible_positions[
+                np.argmax(hidden_voice_score[eligible_positions])
+            ]
+            hidden_mask[best_position] = True
+
+    role = np.full(sample_count, "일반 의견", dtype=object)
+    role[hidden_mask] = "숨은 목소리"
+    role[boundary_mask] = "경계 의견"
+    role[representative_mask] = "대표 의견"
+
+    result = df[["text", "cluster"]].copy()
+    result.insert(0, "row_id", np.arange(sample_count, dtype=int))
+    result["voice_type"] = role
+    result["center_similarity"] = assigned_similarity
+    result["second_similarity"] = second_similarity
+    result["cluster_margin"] = cluster_margin
+    result["local_cohesion"] = local_cohesion
+    result["hidden_voice_score"] = hidden_voice_score
+    return result
+
+
+def _make_voice_topic_figure(opinion_role_df: pd.DataFrame) -> Any:
+    """의견 역할을 도형으로 구분한 선택 가능한 UMAP 지도를 만든다."""
+    plot_df = opinion_role_df.copy()
+    plot_df["cluster_label"] = (
+        "Cluster " + plot_df["cluster"].astype(str)
+    )
+    cluster_order = [
+        f"Cluster {cluster_id}"
+        for cluster_id in sorted(plot_df["cluster"].unique())
+    ]
+
+    figure = px.scatter(
+        plot_df,
+        x="umap_x",
+        y="umap_y",
+        color="cluster_label",
+        symbol="voice_type",
+        hover_name="text",
+        custom_data=[
+            "row_id",
+            "voice_type",
+            "cluster_margin",
+            "center_similarity",
+            "local_cohesion",
+        ],
+        hover_data={
+            "row_id": False,
+            "cluster": True,
+            "cluster_label": False,
+            "voice_type": True,
+            "cluster_margin": ":.4f",
+            "center_similarity": ":.4f",
+            "local_cohesion": ":.4f",
+            "umap_x": ":.3f",
+            "umap_y": ":.3f",
+        },
+        category_orders={
+            "cluster_label": cluster_order,
+            "voice_type": VOICE_TYPE_ORDER,
+        },
+        symbol_map=VOICE_SYMBOL_MAP,
+        labels={
+            "umap_x": "UMAP Dimension 1",
+            "umap_y": "UMAP Dimension 2",
+            "cluster_label": "Cluster",
+            "voice_type": "의견 유형",
+            "cluster_margin": "클러스터 경계 여유",
+            "center_similarity": "중심 유사도",
+            "local_cohesion": "주변 응집도",
+        },
+        title="숨은 목소리 UMAP 정책 탐색 지도",
+        color_discrete_sequence=px.colors.qualitative.Set2,
+    )
+
+    for trace in figure.data:
+        name = str(getattr(trace, "name", ""))
+        if "대표 의견" in name:
+            trace.update(marker={"size": 15, "opacity": 0.95})
+        elif "경계 의견" in name:
+            trace.update(marker={"size": 12, "opacity": 0.9})
+        elif "숨은 목소리" in name:
+            trace.update(marker={"size": 13, "opacity": 0.95})
+        else:
+            trace.update(marker={"size": 8, "opacity": 0.55})
+
+    figure.update_layout(
+        height=720,
+        dragmode="lasso",
+        legend_title_text="Cluster · 의견 유형",
+        hoverlabel={"align": "left", "namelength": -1},
+    )
+    return figure
+
+
 def _make_topic_figure(
     plot_df: pd.DataFrame,
     x_column: str,
@@ -712,13 +912,30 @@ def build_analysis(file_path: str | Path, n_clusters: int) -> dict[str, Any]:
     )
 
     topic_maps = _build_topic_maps(df, embeddings)
+    opinion_role_df = _classify_opinion_roles(
+        df,
+        embeddings,
+        kmeans,
+    )
+    opinion_role_df["pca_x"] = df["pca_x"].to_numpy(copy=True)
+    opinion_role_df["pca_y"] = df["pca_y"].to_numpy(copy=True)
+    opinion_role_df["umap_x"] = df["umap_x"].to_numpy(copy=True)
+    opinion_role_df["umap_y"] = df["umap_y"].to_numpy(copy=True)
+    voice_topic_map = _make_voice_topic_figure(opinion_role_df)
     search_state = {
         "texts": df["text"].tolist(),
         "clusters": df["cluster"].to_numpy(copy=True),
         "embeddings": embeddings,
     }
 
+    analysis_id = hashlib.sha256(
+        ("\n".join(df["text"].tolist()) + f"\nk={n_clusters}").encode(
+            "utf-8"
+        )
+    ).hexdigest()[:12]
+
     return {
+        "analysis_id": analysis_id,
         "df": df,
         "embeddings": embeddings,
         "kmeans": kmeans,
@@ -732,6 +949,8 @@ def build_analysis(file_path: str | Path, n_clusters: int) -> dict[str, Any]:
         "silhouette_figure": silhouette_figure,
         "pca_topic_map": topic_maps["pca_figure"],
         "umap_topic_map": topic_maps["umap_figure"],
+        "voice_topic_map": voice_topic_map,
+        "opinion_role_df": opinion_role_df,
         "pca_model": topic_maps["pca_model"],
         "umap_model": topic_maps["umap_model"],
         "pca_explained_variance": topic_maps[
@@ -833,6 +1052,288 @@ def filter_cluster_opinions(
     return summary, filtered_df
 
 
+def _extract_keywords_from_texts(
+    texts: list[str],
+    top_n: int = 8,
+) -> str:
+    """선택 의견들의 평균 TF-IDF 기준 상위 키워드를 반환한다."""
+    if not texts:
+        return ""
+
+    vectorizer = TfidfVectorizer(
+        stop_words=sorted(DEFAULT_STOPWORDS),
+        token_pattern=r"(?u)\b[가-힣]{2,}\b",
+        ngram_range=(1, 2),
+    )
+    try:
+        matrix = vectorizer.fit_transform(texts)
+    except ValueError:
+        return ""
+
+    mean_scores = np.asarray(matrix.mean(axis=0)).ravel()
+    feature_names = vectorizer.get_feature_names_out()
+    ranked = np.argsort(-mean_scores, kind="stable")
+    keywords = [
+        feature_names[index]
+        for index in ranked
+        if mean_scores[index] > 0
+    ][:top_n]
+    return ", ".join(keywords)
+
+
+def _extract_selected_row_ids(event: Any) -> list[int]:
+    """Streamlit Plotly 선택 이벤트에서 전역 row_id를 복원한다."""
+    if event is None:
+        return []
+
+    selection = getattr(event, "selection", None)
+    if selection is None and isinstance(event, dict):
+        selection = event.get("selection")
+    if not selection:
+        return []
+
+    points = getattr(selection, "points", None)
+    if points is None and isinstance(selection, dict):
+        points = selection.get("points", [])
+
+    row_ids: list[int] = []
+    for point in points or []:
+        custom_data = (
+            point.get("customdata", [])
+            if isinstance(point, dict)
+            else getattr(point, "customdata", [])
+        )
+        if custom_data is None or len(custom_data) == 0:
+            continue
+        try:
+            row_ids.append(int(custom_data[0]))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(row_ids))
+
+
+def _get_selected_opinions(
+    analysis: dict[str, Any],
+    row_ids: list[int],
+) -> pd.DataFrame:
+    """선택된 row_id에 해당하는 의견을 지도 순서와 무관하게 반환한다."""
+    role_df = analysis["opinion_role_df"]
+    valid_ids = [
+        row_id
+        for row_id in row_ids
+        if 0 <= row_id < len(role_df)
+    ]
+    if not valid_ids:
+        return role_df.iloc[0:0].copy()
+    return (
+        role_df.set_index("row_id", drop=False)
+        .loc[valid_ids]
+        .reset_index(drop=True)
+    )
+
+
+def _get_selection_representatives(
+    selected_df: pd.DataFrame,
+    embeddings: np.ndarray,
+    top_n: int = 3,
+) -> pd.DataFrame:
+    """선택 영역의 임베딩 중심에 가까운 실제 의견을 반환한다."""
+    if selected_df.empty:
+        return pd.DataFrame(
+            columns=["순위", "중심 유사도", "의견 유형", "text"]
+        )
+
+    row_ids = selected_df["row_id"].astype(int).to_numpy()
+    selected_embeddings = embeddings[row_ids]
+    centroid = selected_embeddings.mean(axis=0, keepdims=True)
+    similarities = cosine_similarity(
+        selected_embeddings,
+        centroid,
+    ).ravel()
+    ranked = np.argsort(-similarities, kind="stable")[:top_n]
+    return pd.DataFrame(
+        {
+            "순위": range(1, len(ranked) + 1),
+            "중심 유사도": similarities[ranked],
+            "의견 유형": selected_df.iloc[ranked]["voice_type"].tolist(),
+            "text": selected_df.iloc[ranked]["text"].tolist(),
+        }
+    )
+
+
+def _is_safe_http_url(value: Any) -> bool:
+    """Grounding 결과 링크가 일반 HTTP(S) URL인지 확인한다."""
+    try:
+        parsed = urlparse(str(value))
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _escape_markdown_label(value: Any) -> str:
+    """Markdown 링크 라벨에서 구문 문자를 제거한다."""
+    return (
+        str(value or "출처")
+        .replace("[", "(")
+        .replace("]", ")")
+        .replace("\n", " ")
+        .strip()
+    )
+
+
+def _extract_grounding_result(response: Any) -> dict[str, Any]:
+    """Gemini 응답에 인라인 출처 링크와 출처 목록을 결합한다."""
+    text = str(getattr(response, "text", "") or "").strip()
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return {
+            "markdown": text,
+            "sources": [],
+            "queries": [],
+            "search_widget_html": "",
+        }
+
+    grounding = getattr(candidates[0], "grounding_metadata", None)
+    if grounding is None:
+        return {
+            "markdown": text,
+            "sources": [],
+            "queries": [],
+            "search_widget_html": "",
+        }
+
+    chunks = list(getattr(grounding, "grounding_chunks", None) or [])
+    supports = list(getattr(grounding, "grounding_supports", None) or [])
+    sources: list[dict[str, Any]] = []
+    source_by_chunk: dict[int, dict[str, Any]] = {}
+
+    for chunk_index, chunk in enumerate(chunks):
+        web = getattr(chunk, "web", None)
+        uri = getattr(web, "uri", None) if web is not None else None
+        title = getattr(web, "title", None) if web is not None else None
+        if not _is_safe_http_url(uri):
+            continue
+        source = {
+            "number": chunk_index + 1,
+            "title": _escape_markdown_label(title),
+            "uri": str(uri),
+        }
+        sources.append(source)
+        source_by_chunk[chunk_index] = source
+
+    for support in sorted(
+        supports,
+        key=lambda item: int(
+            getattr(getattr(item, "segment", None), "end_index", 0) or 0
+        ),
+        reverse=True,
+    ):
+        segment = getattr(support, "segment", None)
+        end_index = getattr(segment, "end_index", None)
+        chunk_indices = list(
+            getattr(support, "grounding_chunk_indices", None) or []
+        )
+        if end_index is None:
+            continue
+        links = [
+            f"[{source_by_chunk[index]['number']}]"
+            f"({source_by_chunk[index]['uri']})"
+            for index in chunk_indices
+            if index in source_by_chunk
+        ]
+        if not links:
+            continue
+        position = min(max(int(end_index), 0), len(text))
+        text = text[:position] + " " + " ".join(links) + text[position:]
+
+    search_entry_point = getattr(grounding, "search_entry_point", None)
+    rendered_content = (
+        getattr(search_entry_point, "rendered_content", "")
+        if search_entry_point is not None
+        else ""
+    )
+    queries = list(getattr(grounding, "web_search_queries", None) or [])
+    return {
+        "markdown": text,
+        "sources": sources,
+        "queries": [str(query) for query in queries],
+        "search_widget_html": str(rendered_content or ""),
+    }
+
+
+def _generate_grounded_policy_report(
+    selected_df: pd.DataFrame,
+    keywords: str,
+    policy_scope: str,
+) -> dict[str, Any]:
+    """선택 의견을 실제 정책·지원사업 근거가 있는 제안으로 변환한다."""
+    if selected_df.empty:
+        raise ValueError("정책 제안을 생성할 의견을 먼저 선택해 주세요.")
+
+    role_priority = {
+        "숨은 목소리": 0,
+        "경계 의견": 1,
+        "대표 의견": 2,
+        "일반 의견": 3,
+    }
+    prompt_df = selected_df.copy()
+    prompt_df["_priority"] = prompt_df["voice_type"].map(
+        role_priority
+    ).fillna(4)
+    prompt_df = prompt_df.sort_values(
+        ["_priority", "hidden_voice_score"],
+        ascending=[True, False],
+        kind="stable",
+    ).head(50)
+
+    opinion_lines: list[str] = []
+    total_chars = 0
+    for row in prompt_df.itertuples(index=False):
+        line = f"- [{row.voice_type} / Cluster {row.cluster}] {row.text}"
+        if opinion_lines and total_chars + len(line) > 16000:
+            break
+        opinion_lines.append(line)
+        total_chars += len(line)
+
+    scope = str(policy_scope or "대한민국").strip()[:200]
+    prompt = (
+        "당신은 시민 의견을 실제 공공정책과 연결하는 정책 분석가입니다. "
+        "Google Search를 사용해 현재 운영 중이거나 최근 공식 발표된 정책·"
+        "지원사업·공공서비스를 확인하고, 공식 정부·지자체·공공기관 출처를 "
+        "우선하세요. 확인하지 못한 사업명, 수치, 시행기관을 만들지 마세요. "
+        "종료되었거나 현재 상태가 불명확하면 그 사실을 명시하세요.\n\n"
+        "아래 제목을 정확히 유지한 한국어 Markdown 보고서를 작성하세요.\n"
+        "## 선택 의견의 Issue\n"
+        "## Root Cause\n"
+        "## 권장 Action\n"
+        "## 실제 유사 정책·지원사업\n"
+        "실제 사례를 2~4개 제시하고, 사업명·운영기관·핵심 내용·현재 의견과의 "
+        "연결점을 설명하세요. 검색으로 확인한 사실만 쓰세요.\n"
+        "## 차별화 제안\n"
+        "기존 정책과 겹치는 부분, 부족한 부분, 새로 설계할 기능을 구분하세요.\n"
+        "## 90일 실행안\n"
+        "담당 주체와 검증 지표가 포함된 3단계 실행안을 제시하세요.\n\n"
+        f"기준일: {date.today().isoformat()}\n"
+        f"정책 검색 범위: {scope}\n"
+        f"선택 의견 수: {len(selected_df)}\n"
+        f"선택 영역 키워드: {keywords or '추출되지 않음'}\n\n"
+        "선택 의견:\n" + "\n".join(opinion_lines)
+    )
+
+    client = get_gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=prompt,
+        config={"tools": [{"google_search": {}}]},
+    )
+    report = _extract_grounding_result(response)
+    if not report["markdown"]:
+        raise ValueError("Gemini API가 비어 있는 정책 보고서를 반환했습니다.")
+    report["scope"] = scope
+    report["selected_count"] = len(selected_df)
+    return report
+
+
 def _save_uploaded_csv(uploaded_file: Any) -> str:
     """Streamlit UploadedFile을 임시 CSV 경로로 저장한다."""
     suffix = Path(getattr(uploaded_file, "name", "upload.csv")).suffix
@@ -869,6 +1370,9 @@ def _initialize_streamlit_state() -> None:
         "search_top_k": 5,
         "exact_results": EMPTY_EXACT_RESULTS.copy(),
         "semantic_results": EMPTY_SEMANTIC_RESULTS.copy(),
+        "policy_scope": "광주광역시·전라남도 및 대한민국",
+        "policy_report": None,
+        "policy_report_signature": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1040,6 +1544,208 @@ def _render_search(analysis: dict[str, Any]) -> None:
         )
 
 
+def _render_policy_report(report: dict[str, Any]) -> None:
+    """Grounding 정책 보고서와 검색 출처를 표시한다."""
+    st.divider()
+    st.subheader("근거 기반 정책 제안")
+    st.markdown(report["markdown"])
+
+    search_widget_html = report.get("search_widget_html", "")
+    if search_widget_html:
+        st.html(search_widget_html)
+
+    sources = report.get("sources", [])
+    if sources:
+        with st.expander(f"Google Search 근거 출처 {len(sources)}개"):
+            for source in sources:
+                st.markdown(
+                    f"{source['number']}. [{source['title']}]"
+                    f"({source['uri']})"
+                )
+    else:
+        st.warning(
+            "응답에 Grounding 출처 메타데이터가 없습니다. 정책명과 "
+            "시행 여부를 공식 사이트에서 다시 확인해 주세요."
+        )
+
+    queries = report.get("queries", [])
+    if queries:
+        st.caption("Google Search 검색어: " + " · ".join(queries))
+
+
+def _render_policy_explorer(analysis: dict[str, Any]) -> None:
+    """UMAP 선택 → 숨은 의견 확인 → 정책 근거 검색 흐름을 렌더링한다."""
+    st.markdown("### AI 정책 탐색기")
+    st.caption(
+        "별은 대표 의견, 빈 마름모는 경계 의견, X는 숨은 목소리 "
+        "후보입니다. 툴바의 올가미 또는 박스로 관심 영역을 선택하세요."
+    )
+
+    event = st.plotly_chart(
+        analysis["voice_topic_map"],
+        width="stretch",
+        key=f"policy_explorer_map_{analysis['analysis_id']}",
+        on_select="rerun",
+        selection_mode=["points", "box", "lasso"],
+        config={"displaylogo": False, "scrollZoom": True},
+    )
+    selected_row_ids = _extract_selected_row_ids(event)
+    selected_df = _get_selected_opinions(analysis, selected_row_ids)
+
+    if selected_df.empty:
+        st.info(
+            "지도에서 하나 이상의 점을 선택하면 해당 영역의 키워드, "
+            "대표 원문과 실제 정책 근거 검색 기능이 열립니다."
+        )
+        candidates = analysis["opinion_role_df"]
+        candidates = candidates[
+            candidates["voice_type"].isin(["경계 의견", "숨은 목소리"])
+        ].copy()
+        if not candidates.empty:
+            candidates = candidates.sort_values(
+                ["voice_type", "hidden_voice_score"],
+                ascending=[True, False],
+                kind="stable",
+            )
+            display_candidates = candidates[
+                [
+                    "voice_type",
+                    "cluster",
+                    "cluster_margin",
+                    "center_similarity",
+                    "local_cohesion",
+                    "text",
+                ]
+            ].head(20).copy()
+            for column in (
+                "cluster_margin",
+                "center_similarity",
+                "local_cohesion",
+            ):
+                display_candidates[column] = display_candidates[column].round(4)
+            with st.expander("우선 확인할 숨은·경계 의견 후보 Top 20"):
+                st.dataframe(
+                    display_candidates,
+                    width="stretch",
+                    hide_index=True,
+                )
+        return
+
+    keywords = _extract_keywords_from_texts(
+        selected_df["text"].astype(str).tolist(),
+        top_n=8,
+    )
+    metrics = st.columns(4)
+    metrics[0].metric("선택 의견", f"{len(selected_df):,}개")
+    metrics[1].metric(
+        "포함 클러스터",
+        f"{selected_df['cluster'].nunique():,}개",
+    )
+    metrics[2].metric(
+        "숨은 목소리",
+        int((selected_df["voice_type"] == "숨은 목소리").sum()),
+    )
+    metrics[3].metric(
+        "경계 의견",
+        int((selected_df["voice_type"] == "경계 의견").sum()),
+    )
+    st.markdown(f"**선택 영역 키워드:** {keywords or '추출되지 않음'}")
+
+    representatives = _get_selection_representatives(
+        selected_df,
+        analysis["embeddings"],
+        top_n=3,
+    )
+    representatives["중심 유사도"] = representatives[
+        "중심 유사도"
+    ].round(4)
+    st.markdown("#### 선택 영역 대표 원문")
+    st.dataframe(
+        representatives,
+        width="stretch",
+        hide_index=True,
+    )
+
+    with st.expander(f"선택한 원문 전체 {len(selected_df):,}개"):
+        display_df = selected_df[
+            [
+                "row_id",
+                "voice_type",
+                "cluster",
+                "cluster_margin",
+                "center_similarity",
+                "local_cohesion",
+                "text",
+            ]
+        ].copy()
+        for column in (
+            "cluster_margin",
+            "center_similarity",
+            "local_cohesion",
+        ):
+            display_df[column] = display_df[column].round(4)
+        st.dataframe(display_df, width="stretch", hide_index=True)
+
+    st.markdown("#### 실제 정책·지원사업 연결")
+    st.text_input(
+        "정책 검색 지역·범위",
+        key="policy_scope",
+        help="예: 광주광역시·전라남도 및 대한민국",
+    )
+    st.caption(
+        "버튼을 누르면 선택 의견 일부가 Gemini API로 전송되고 Google "
+        "Search Grounding 검색이 실행됩니다. 검색 쿼리 수에 따라 비용과 "
+        "응답 시간이 늘어날 수 있습니다."
+    )
+
+    api_key_available = bool(_get_gemini_api_key())
+    generate_button = st.button(
+        "선택 의견으로 근거 기반 정책 제안 생성",
+        type="primary",
+        width="stretch",
+        disabled=not api_key_available,
+        key=f"generate_policy_{analysis['analysis_id']}",
+    )
+    if not api_key_available:
+        st.info(
+            "정책 검색을 사용하려면 Streamlit Secrets에 "
+            "GEMINI_API_KEY를 설정하세요."
+        )
+
+    signature = (
+        analysis["analysis_id"],
+        tuple(selected_row_ids),
+        str(st.session_state.policy_scope).strip(),
+    )
+    if generate_button:
+        try:
+            with st.spinner(
+                "공식 정책·지원사업을 검색하고 차별화 제안을 작성하고 "
+                "있습니다..."
+            ):
+                st.session_state.policy_report = (
+                    _generate_grounded_policy_report(
+                        selected_df,
+                        keywords,
+                        st.session_state.policy_scope,
+                    )
+                )
+                st.session_state.policy_report_signature = signature
+        except Exception as error:
+            st.error(f"정책 제안 생성에 실패했습니다: {error}")
+
+    if (
+        st.session_state.policy_report is not None
+        and st.session_state.policy_report_signature == signature
+    ):
+        _render_policy_report(st.session_state.policy_report)
+    elif st.session_state.policy_report is not None:
+        st.info(
+            "선택 영역 또는 검색 범위가 바뀌었습니다. 현재 선택으로 "
+            "정책 제안을 다시 생성해 주세요."
+        )
+
+
 def _render_analysis(analysis: dict[str, Any]) -> None:
     """전체 분석 결과 탭을 렌더링한다."""
     _render_analysis_header(analysis)
@@ -1051,6 +1757,7 @@ def _render_analysis(analysis: dict[str, Any]) -> None:
             "Silhouette",
             "PCA Topic Map",
             "UMAP Topic Map",
+            "AI 정책 탐색기",
             "클러스터 의견",
             "의견 검색",
         ]
@@ -1117,9 +1824,12 @@ def _render_analysis(analysis: dict[str, Any]) -> None:
         )
 
     with tabs[5]:
-        _render_cluster_filter(analysis)
+        _render_policy_explorer(analysis)
 
     with tabs[6]:
+        _render_cluster_filter(analysis)
+
+    with tabs[7]:
         _render_search(analysis)
 
 
@@ -1135,7 +1845,8 @@ def main() -> None:
     st.title("의견 분석 대시보드")
     st.write(
         "CSV의 `text` 컬럼을 임베딩하고 클러스터별 핵심 주제, "
-        "대표 의견, Issue / Root Cause / Action을 분석합니다."
+        "대표·경계·숨은 의견, Issue / Root Cause / Action과 실제 "
+        "정책 근거를 분석합니다."
     )
 
     with st.sidebar:
@@ -1162,7 +1873,7 @@ def main() -> None:
         st.caption(
             "Gemini 자동 요약을 사용하려면 Streamlit Secrets 또는 "
             "서버 환경변수에 GEMINI_API_KEY를 설정하세요. 의견 표본은 "
-            "요약 생성을 위해 Gemini API로 전송됩니다."
+            "요약과 선택 영역 정책 검색을 위해 Gemini API로 전송됩니다."
         )
 
     if analyze_button:
@@ -1180,6 +1891,8 @@ def main() -> None:
                     )
                     st.session_state.analysis = analysis
                     st.session_state.selected_cluster = None
+                    st.session_state.policy_report = None
+                    st.session_state.policy_report_signature = None
                     _set_default_search_results(analysis)
                 st.success("분석이 완료되었습니다.")
             except Exception as error:
