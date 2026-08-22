@@ -967,6 +967,13 @@ def _render_cluster_filter(analysis: dict[str, Any]) -> None:
 
 def _render_search(analysis: dict[str, Any]) -> None:
     """Exact keyword search와 semantic search를 비교한다."""
+    search_state = analysis["search_state"]
+    max_top_k = max(1, min(20, len(search_state["texts"])))
+    st.session_state.search_top_k = min(
+        max(int(st.session_state.get("search_top_k", 5)), 1),
+        max_top_k,
+    )
+
     with st.form("opinion_search_form"):
         search_columns = st.columns([3, 1])
         with search_columns[0]:
@@ -978,8 +985,8 @@ def _render_search(analysis: dict[str, Any]) -> None:
         with search_columns[1]:
             st.slider(
                 "Top-K",
-                minimum=1,
-                maximum=20,
+                min_value=1,
+                max_value=max_top_k,
                 step=1,
                 key="search_top_k",
             )
@@ -996,7 +1003,6 @@ def _render_search(analysis: dict[str, Any]) -> None:
             st.warning("검색어를 입력해 주세요.")
         else:
             try:
-                search_state = analysis["search_state"]
                 st.session_state.exact_results = exact_keyword_search(
                     query,
                     search_state,
